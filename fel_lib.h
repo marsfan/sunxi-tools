@@ -59,8 +59,8 @@ feldev_list_entry *list_fel_devices(size_t *count);
 /* FEL functions */
 
 void aw_fel_read(feldev_handle *dev, uint32_t offset, void *buf, size_t len);
-void aw_fel_write(feldev_handle *dev, void *buf, uint32_t offset, size_t len);
-void aw_fel_write_buffer(feldev_handle *dev, void *buf, uint32_t offset,
+void aw_fel_write(feldev_handle *dev, const void *buf, uint32_t offset, size_t len);
+void aw_fel_write_buffer(feldev_handle *dev, const void *buf, uint32_t offset,
 			 size_t len, bool progress);
 void aw_fel_execute(feldev_handle *dev, uint32_t offset);
 
@@ -80,5 +80,13 @@ void fel_clrsetbits_le32(feldev_handle *dev,
 /* retrieve SID root key */
 bool fel_get_sid_root_key(feldev_handle *dev, uint32_t *result,
 			  bool force_workaround);
+
+bool aw_fel_remotefunc_prepare(feldev_handle *dev,
+			       size_t                stack_size,
+			       void                 *arm_code,
+			       size_t                arm_code_size,
+			       size_t                num_args,
+			       uint32_t             *args);
+bool aw_fel_remotefunc_execute(feldev_handle *dev, uint32_t *result);
 
 #endif /* _SUNXI_TOOLS_FEL_LIB_H */

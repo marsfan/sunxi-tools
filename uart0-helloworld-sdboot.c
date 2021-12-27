@@ -61,6 +61,16 @@ typedef unsigned int u32;
 #define AW_CCM_BASE		0x01c20000
 #define AW_SRAMCTRL_BASE	0x01c00000
 
+#define H6_UART0_BASE		0x05000000
+#define H6_PIO_BASE		0x0300B000
+#define H6_CCM_BASE		0x03001000
+#define H6_SRAMCTRL_BASE	0x03000000
+
+#define F1C100S_UART0_BASE	0x01c25000
+
+#define R329_UART0_BASE		0x02500000
+#define R329_PIO_BASE		0x02000400
+#define R329_CCM_BASE		0x02001000
 /*****************************************************************************
  * GPIO code, borrowed from U-Boot                                           *
  *****************************************************************************/
@@ -134,12 +144,17 @@ enum sunxi_gpio_number {
 /* GPIO pin function config */
 #define SUNXI_GPIO_INPUT        (0)
 #define SUNXI_GPIO_OUTPUT       (1)
+#define SUNIV_GPE_UART0		(5)
 #define SUN4I_GPB_UART0         (2)
 #define SUN5I_GPB_UART0         (2)
 #define SUN6I_GPH_UART0         (2)
 #define SUN8I_H3_GPA_UART0      (2)
 #define SUN8I_V3S_GPB_UART0	(3)
+#define SUN8I_V831_GPH_UART0	(5)
 #define SUN50I_H5_GPA_UART0     (2)
+#define SUN50I_H6_GPH_UART0	(2)
+#define SUN50I_H616_GPH_UART0	(2)
+#define SUN50I_R329_GPB_UART0   (2)
 #define SUN50I_A64_GPB_UART0    (4)
 #define SUNXI_GPF_UART0         (4)
 
@@ -148,6 +163,8 @@ enum sunxi_gpio_number {
 #define SUNXI_GPIO_PULL_UP      (1)
 #define SUNXI_GPIO_PULL_DOWN    (2)
 
+static u32 pio_base;
+
 int sunxi_gpio_set_cfgpin(u32 pin, u32 val)
 {
 	u32 cfg;
@@ -155,7 +172,7 @@ int sunxi_gpio_set_cfgpin(u32 pin, u32 val)
 	u32 index = GPIO_CFG_INDEX(pin);
 	u32 offset = GPIO_CFG_OFFSET(pin);
 	struct sunxi_gpio *pio =
-		&((struct sunxi_gpio_reg *)SUNXI_PIO_BASE)->gpio_bank[bank];
+		&((struct sunxi_gpio_reg *)pio_base)->gpio_bank[bank];
 	cfg = readl(&pio->cfg[0] + index);
 	cfg &= ~(0xf << offset);
 	cfg |= val << offset;
@@ -170,7 +187,7 @@ int sunxi_gpio_set_pull(u32 pin, u32 val)
 	u32 index = GPIO_PULL_INDEX(pin);
 	u32 offset = GPIO_PULL_OFFSET(pin);
 	struct sunxi_gpio *pio =
-		&((struct sunxi_gpio_reg *)SUNXI_PIO_BASE)->gpio_bank[bank];
+		&((struct sunxi_gpio_reg *)pio_base)->gpio_bank[bank];
 	cfg = readl(&pio->pull[0] + index);
 	cfg &= ~(0x3 << offset);
 	cfg |= val << offset;
@@ -184,7 +201,7 @@ int sunxi_gpio_output(u32 pin, u32 val)
 	u32 bank = GPIO_BANK(pin);
 	u32 num = GPIO_NUM(pin);
 	struct sunxi_gpio *pio =
-		&((struct sunxi_gpio_reg *)SUNXI_PIO_BASE)->gpio_bank[bank];
+		&((struct sunxi_gpio_reg *)pio_base)->gpio_bank[bank];
 	dat = readl(&pio->dat);
 	if(val)
 		dat |= 1 << num;
@@ -200,7 +217,7 @@ int sunxi_gpio_input(u32 pin)
 	u32 bank = GPIO_BANK(pin);
 	u32 num = GPIO_NUM(pin);
 	struct sunxi_gpio *pio =
-		&((struct sunxi_gpio_reg *)SUNXI_PIO_BASE)->gpio_bank[bank];
+		&((struct sunxi_gpio_reg *)pio_base)->gpio_bank[bank];
 	dat = readl(&pio->dat);
 	dat >>= num;
 	return (dat & 0x1);
@@ -228,9 +245,13 @@ int gpio_direction_output(unsigned gpio, int value)
  *                                                                           *
  * Allwinner A10s and A13 are using the same SoC type id, but they can be    *
  * differentiated using a certain part of the SID register.                  *
+ *                                                                           *
+ * Allwinner H6 has its memory map totally reworked, but the SRAM controller *
+ * remains similar; the base of it is moved to 0x03000000.                   *
  *****************************************************************************/
 
 #define VER_REG			(AW_SRAMCTRL_BASE + 0x24)
+#define H6_VER_REG		(H6_SRAMCTRL_BASE + 0x24)
 #define SUN4I_SID_BASE		0x01C23800
 #define SUN8I_SID_BASE		0x01C14000
 
@@ -266,8 +287,21 @@ void soc_detection_init(void)
 	if (((midr >> 4) & 0xFFF) == 0xC0F) {
 		soc_id = 0x1639; /* ARM Cortex-A15, so likely Allwinner A80 */
 	} else {
-		set_wbit(VER_REG, 1 << 15);
-		soc_id = readl(VER_REG) >> 16;
+		u32 reg;
+
+		/*
+		 * This register is GICD_IIDR on H6, but unmapped according to
+		 * other known SoCs' user manuals.
+		 */
+		reg = readl(0x03021008);
+
+		if ((reg & 0xfff) == 0x43b) /* Found GICv2 here, so it's a H6 */
+			reg = H6_VER_REG;
+		else
+			reg = VER_REG;
+
+		set_wbit(reg, 1 << 15);
+		soc_id = readl(reg) >> 16;
 	}
 }
 
@@ -278,9 +312,14 @@ void soc_detection_init(void)
 #define soc_is_a31()	(soc_id == 0x1633)
 #define soc_is_a80()	(soc_id == 0x1639)
 #define soc_is_a64()	(soc_id == 0x1689)
+#define soc_is_f1c100s()	(soc_id == 0x1663)
 #define soc_is_h5()	(soc_id == 0x1718)
+#define soc_is_h6()	(soc_id == 0x1728)
+#define soc_is_h616()	(soc_id == 0x1823)
+#define soc_is_r329()	(soc_id == 0x1851)
 #define soc_is_r40()	(soc_id == 0x1701)
 #define soc_is_v3s()	(soc_id == 0x1681)
+#define soc_is_v831()	(soc_id == 0x1817)
 
 /* A10s and A13 share the same ID, so we need a little more effort on those */
 
@@ -334,12 +373,65 @@ int soc_is_h3(void)
 #define APB2_GATE_UART_SHIFT	(16)
 #define APB2_RESET_UART_SHIFT	(16)
 
-void clock_init_uart(void)
+#define H6_UART_GATE_RESET	(H6_CCM_BASE + 0x90C)
+#define R329_UART_GATE_RESET	(R329_CCM_BASE + 0x90C)
+#define H6_UART_GATE_SHIFT	(0)
+#define H6_UART_RESET_SHIFT	(16)
+
+#define F1C100S_GATE2		(AW_CCM_BASE + 0x068)
+#define F1C100S_RESET2		(AW_CCM_BASE + 0x2D0)
+#define F1C100S_GATE2_UART_SHIFT	(20)
+#define F1C100S_RESET2_UART_SHIFT	(20)
+
+void clock_init_uart_legacy(void)
 {
 	/* Open the clock gate for UART0 */
 	set_wbit(APB2_GATE, 1 << (APB2_GATE_UART_SHIFT + CONFIG_CONS_INDEX - 1));
 	/* Deassert UART0 reset (only needed on A31/A64/H3) */
 	set_wbit(APB2_RESET, 1 << (APB2_RESET_UART_SHIFT + CONFIG_CONS_INDEX - 1));
+}
+
+void clock_init_uart_h6(void)
+{
+	/* Open the clock gate for UART0 */
+	set_wbit(H6_UART_GATE_RESET, 1 << (H6_UART_GATE_SHIFT + CONFIG_CONS_INDEX - 1));
+	/* Deassert UART0 reset */
+	set_wbit(H6_UART_GATE_RESET, 1 << (H6_UART_RESET_SHIFT + CONFIG_CONS_INDEX - 1));
+}
+
+void clock_init_uart_f1c100s(void)
+{
+	/* PLL_PERIPH = 600MHz */
+	writel(0x80041800, 0x01c20028);
+	while(!(readl(0x01c20028) & 0x10000000))
+		;
+	/* AHB1 = 600MHz / 3 / 1 = 200MHz, APB1 = 200MHz / 2 = 100MHz */
+	writel(0x00003180, 0x01c20054);
+
+	/* Open the clock gate for UART0 */
+	set_wbit(F1C100S_GATE2, 1 << (F1C100S_GATE2_UART_SHIFT + CONFIG_CONS_INDEX - 1));
+	/* Deassert UART0 reset */
+	set_wbit(F1C100S_RESET2, 1 << (F1C100S_RESET2_UART_SHIFT + CONFIG_CONS_INDEX - 1));
+}
+
+void clock_init_uart_r329(void)
+{
+	/* Open the clock gate for UART0 */
+	set_wbit(R329_UART_GATE_RESET, 1 << (H6_UART_GATE_SHIFT + CONFIG_CONS_INDEX - 1));
+	/* Deassert UART0 reset */
+	set_wbit(R329_UART_GATE_RESET, 1 << (H6_UART_RESET_SHIFT + CONFIG_CONS_INDEX - 1));
+}
+
+void clock_init_uart(void)
+{
+	if (soc_is_f1c100s())
+		clock_init_uart_f1c100s();
+	else if (soc_is_h6() || soc_is_v831() || soc_is_h616())
+		clock_init_uart_h6();
+	else if (soc_is_r329())
+		clock_init_uart_r329();
+	else
+		clock_init_uart_legacy();
 }
 
 /*****************************************************************************
@@ -374,6 +466,10 @@ void gpio_init(void)
 		sunxi_gpio_set_cfgpin(SUNXI_GPB(8), SUN50I_A64_GPB_UART0);
 		sunxi_gpio_set_cfgpin(SUNXI_GPB(9), SUN50I_A64_GPB_UART0);
 		sunxi_gpio_set_pull(SUNXI_GPB(9), SUNXI_GPIO_PULL_UP);
+	} else if (soc_is_f1c100s()) {
+		sunxi_gpio_set_cfgpin(SUNXI_GPE(0), SUNIV_GPE_UART0);
+		sunxi_gpio_set_cfgpin(SUNXI_GPE(1), SUNIV_GPE_UART0);
+		sunxi_gpio_set_pull(SUNXI_GPE(1), SUNXI_GPIO_PULL_UP);
 	} else if (soc_is_h3() || soc_is_h2_plus()) {
 		sunxi_gpio_set_cfgpin(SUNXI_GPA(4), SUN8I_H3_GPA_UART0);
 		sunxi_gpio_set_cfgpin(SUNXI_GPA(5), SUN8I_H3_GPA_UART0);
@@ -382,10 +478,26 @@ void gpio_init(void)
 		sunxi_gpio_set_cfgpin(SUNXI_GPA(4), SUN50I_H5_GPA_UART0);
 		sunxi_gpio_set_cfgpin(SUNXI_GPA(5), SUN50I_H5_GPA_UART0);
 		sunxi_gpio_set_pull(SUNXI_GPA(5), SUNXI_GPIO_PULL_UP);
+	} else if (soc_is_h6()) {
+		sunxi_gpio_set_cfgpin(SUNXI_GPH(0), SUN50I_H6_GPH_UART0);
+		sunxi_gpio_set_cfgpin(SUNXI_GPH(1), SUN50I_H6_GPH_UART0);
+		sunxi_gpio_set_pull(SUNXI_GPH(1), SUNXI_GPIO_PULL_UP);
+	} else if (soc_is_h616()) {
+		sunxi_gpio_set_cfgpin(SUNXI_GPH(0), SUN50I_H616_GPH_UART0);
+		sunxi_gpio_set_cfgpin(SUNXI_GPH(1), SUN50I_H616_GPH_UART0);
+		sunxi_gpio_set_pull(SUNXI_GPH(1), SUNXI_GPIO_PULL_UP);
+	} else if (soc_is_r329()) {
+		sunxi_gpio_set_cfgpin(SUNXI_GPB(4), SUN50I_R329_GPB_UART0);
+		sunxi_gpio_set_cfgpin(SUNXI_GPB(5), SUN50I_R329_GPB_UART0);
+		sunxi_gpio_set_pull(SUNXI_GPB(5), SUNXI_GPIO_PULL_UP);
 	} else if (soc_is_v3s()) {
 		sunxi_gpio_set_cfgpin(SUNXI_GPB(8), SUN8I_V3S_GPB_UART0);
 		sunxi_gpio_set_cfgpin(SUNXI_GPB(9), SUN8I_V3S_GPB_UART0);
 		sunxi_gpio_set_pull(SUNXI_GPB(9), SUNXI_GPIO_PULL_UP);
+	} else if (soc_is_v831()) {
+		sunxi_gpio_set_cfgpin(SUNXI_GPH(9), SUN8I_V831_GPH_UART0);
+		sunxi_gpio_set_cfgpin(SUNXI_GPH(10), SUN8I_V831_GPH_UART0);
+		sunxi_gpio_set_pull(SUNXI_GPH(10), SUNXI_GPIO_PULL_UP);
 	} else {
 		/* Unknown SoC */
 		while (1) {}
@@ -394,21 +506,30 @@ void gpio_init(void)
 
 /*****************************************************************************/
 
-#define UART0_RBR (SUNXI_UART0_BASE + 0x0)    /* receive buffer register */
-#define UART0_THR (SUNXI_UART0_BASE + 0x0)    /* transmit holding register */
-#define UART0_DLL (SUNXI_UART0_BASE + 0x0)    /* divisor latch low register */
+static u32 uart0_base;
 
-#define UART0_DLH (SUNXI_UART0_BASE + 0x4)    /* divisor latch high register */
-#define UART0_IER (SUNXI_UART0_BASE + 0x4)    /* interrupt enable reigster */
+#define UART0_RBR (uart0_base + 0x0)    /* receive buffer register */
+#define UART0_THR (uart0_base + 0x0)    /* transmit holding register */
+#define UART0_DLL (uart0_base + 0x0)    /* divisor latch low register */
 
-#define UART0_IIR (SUNXI_UART0_BASE + 0x8)    /* interrupt identity register */
-#define UART0_FCR (SUNXI_UART0_BASE + 0x8)    /* fifo control register */
+#define UART0_DLH (uart0_base + 0x4)    /* divisor latch high register */
+#define UART0_IER (uart0_base + 0x4)    /* interrupt enable reigster */
 
-#define UART0_LCR (SUNXI_UART0_BASE + 0xc)    /* line control register */
+#define UART0_IIR (uart0_base + 0x8)    /* interrupt identity register */
+#define UART0_FCR (uart0_base + 0x8)    /* fifo control register */
 
-#define UART0_LSR (SUNXI_UART0_BASE + 0x14)   /* line status register */
+#define UART0_LCR (uart0_base + 0xc)    /* line control register */
+
+#define UART0_LSR (uart0_base + 0x14)   /* line status register */
 
 #define BAUD_115200    (0xD) /* 24 * 1000 * 1000 / 16 / 115200 = 13 */
+/*
+ * Allwinner F1C100s have a different clock tree than ARMv7/v8 Allwinner
+ * SoCs, which has only one AHB clock and APB clock.
+ *
+ * The APB clock is configured to 100MHz in clock_init_uart_f1c100s().
+ */
+#define BAUD_115200_F1C100S	(0x36)
 #define NO_PARITY      (0)
 #define ONE_STOP_BIT   (0)
 #define DAT_LEN_8_BITS (3)
@@ -422,7 +543,10 @@ void uart0_init(void)
 	writel(0x80, UART0_LCR);
 	/* set baudrate */
 	writel(0, UART0_DLH);
-	writel(BAUD_115200, UART0_DLL);
+	if (soc_is_f1c100s())
+		writel(BAUD_115200_F1C100S, UART0_DLL);
+	else
+		writel(BAUD_115200, UART0_DLL);
 	/* set line control */
 	writel(LC_8_N_1, UART0_LCR);
 }
@@ -460,6 +584,10 @@ int get_boot_device(void)
 	u32 *spl_signature = (void *)0x4;
 	if (soc_is_a64() || soc_is_a80() || soc_is_h5())
 		spl_signature = (void *)0x10004;
+	if (soc_is_h6() || soc_is_v831() || soc_is_h616())
+		spl_signature = (void *)0x20004;
+	if (soc_is_r329())
+		spl_signature = (void *)0x100004;
 
 	/* Check the eGON.BT0 magic in the SPL header */
 	if (spl_signature[0] != 0x4E4F4765 || spl_signature[1] != 0x3054422E)
@@ -474,9 +602,28 @@ int get_boot_device(void)
 	return BOOT_DEVICE_UNK;
 }
 
+void bases_init(void)
+{
+	if (soc_is_f1c100s()) {
+		pio_base = SUNXI_PIO_BASE;
+		uart0_base = F1C100S_UART0_BASE;
+	}
+	else if (soc_is_h6() || soc_is_v831() || soc_is_h616()) {
+		pio_base = H6_PIO_BASE;
+		uart0_base = H6_UART0_BASE;
+	} else if (soc_is_r329()) {
+		pio_base = R329_PIO_BASE;
+		uart0_base = R329_UART0_BASE;
+	} else {
+		pio_base = SUNXI_PIO_BASE;
+		uart0_base = SUNXI_UART0_BASE;
+	}
+}
+
 int main(void)
 {
 	soc_detection_init();
+	bases_init();
 	gpio_init();
 	uart0_init();
 
@@ -493,16 +640,26 @@ int main(void)
 		uart0_puts("Allwinner A31/A31s!\n");
 	else if (soc_is_a64())
 		uart0_puts("Allwinner A64!\n");
+	else if (soc_is_f1c100s())
+		uart0_puts("Allwinner F1C100s!\n");
 	else if (soc_is_h2_plus())
 		uart0_puts("Allwinner H2+!\n");
 	else if (soc_is_h3())
 		uart0_puts("Allwinner H3!\n");
 	else if (soc_is_h5())
 		uart0_puts("Allwinner H5!\n");
+	else if (soc_is_h6())
+		uart0_puts("Allwinner H6!\n");
+	else if (soc_is_h616())
+		uart0_puts("Allwinner H616!\n");
+	else if (soc_is_r329())
+		uart0_puts("Allwinner R329!\n");
 	else if (soc_is_r40())
 		uart0_puts("Allwinner R40!\n");
 	else if (soc_is_v3s())
 		uart0_puts("Allwinner V3s!\n");
+	else if (soc_is_v831())
+		uart0_puts("Allwinner V831!\n");
 	else
 		uart0_puts("unknown Allwinner SoC!\n");
 
