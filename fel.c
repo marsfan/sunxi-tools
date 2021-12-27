@@ -19,6 +19,8 @@
 #include "portable_endian.h"
 #include "fel_lib.h"
 #include "fel-spiflash.h"
+#include "thunk.h"
+#include "fit_image.h"
 
 #include <assert.h>
 #include <ctype.h>
@@ -31,9 +33,10 @@
 #include <zlib.h>
 #include <sys/stat.h>
 
-static bool verbose = false; /* If set, makes the 'fel' tool more talkative */
+bool verbose = false; /* If set, makes the 'fel' tool more talkative */
 static uint32_t uboot_entry = 0; /* entry point (address) of U-Boot */
 static uint32_t uboot_size  = 0; /* size of U-Boot binary */
+static bool enter_in_aarch64 = false;
 
 /* printf-style output, but only if "verbose" flag is active */
 #define pr_info(...) \
@@ -45,6 +48,7 @@ static uint32_t uboot_size  = 0; /* size of U-Boot binary */
 #define IH_TYPE_INVALID		0	/* Invalid Image	*/
 #define IH_TYPE_FIRMWARE	5	/* Firmware Image	*/
 #define IH_TYPE_SCRIPT		6	/* Script file		*/
+#define IH_TYPE_FLATDT		8	/* DTB or FIT image	*/
 #define IH_NMLEN		32	/* Image Name Length	*/
 
 /* Additional error codes, newly introduced for get_image_type() */
@@ -90,6 +94,8 @@ int get_image_type(const uint8_t *buf, size_t len)
 	if (len <= HEADER_SIZE) /* insufficient length/size */
 		return IH_TYPE_INVALID;
 
+	if (be32toh(hdr->ih_magic) == 0xd00dfeed)
+		return IH_TYPE_FLATDT;
 	if (be32toh(hdr->ih_magic) != IH_MAGIC) /* signature mismatch */
 		return IH_TYPE_INVALID;
 	/* For sunxi, we always expect ARM architecture here */
@@ -348,10 +354,6 @@ bool aw_fel_remotefunc_execute(feldev_handle *dev, uint32_t *result)
 	}
 	return true;
 }
-
-static uint32_t fel_to_spl_thunk[] = {
-	#include "thunks/fel-to-spl-thunk.h"
-};
 
 #define	DRAM_BASE		0x40000000
 #define	DRAM_SIZE		0x80000000
@@ -618,9 +620,13 @@ uint32_t *aw_backup_and_disable_mmu(feldev_handle *dev,
 	 * checks needs to be relaxed).
 	 */
 
-	/* Basically, ignore M/Z/I/V/UNK bits and expect no TEX remap */
+	/*
+	 * Basically, ignore M/Z/I/V/UNK bits and expect no TEX remap.
+	 * Some bits which are Read-As-One on ARMv7 but Should-Be-Zero
+	 * on ARMv5 are also ignored.
+	 */
 	sctlr = aw_get_sctlr(dev, soc_info);
-	if ((sctlr & ~((0x7 << 11) | (1 << 6) | 1)) != 0x00C50038)
+	if ((sctlr & ~((0x3) << 22 | (0x7 << 11) | (1 << 6) | 1)) != 0x00050038)
 		pr_fatal("Unexpected SCTLR (%08X)\n", sctlr);
 
 	if (!(sctlr & 1)) {
@@ -715,21 +721,19 @@ void aw_restore_and_enable_mmu(feldev_handle *dev,
 	free(tt);
 }
 
-/*
- * Maximum size of SPL, at the same time this is the start offset
- * of the main U-Boot image within u-boot-sunxi-with-spl.bin
- */
-#define SPL_LEN_LIMIT 0x8000
+/* Minimum offset of the main U-Boot image within u-boot-sunxi-with-spl.bin. */
+#define SPL_MIN_OFFSET 0x8000
 
-void aw_fel_write_and_execute_spl(feldev_handle *dev, uint8_t *buf, size_t len)
+uint32_t aw_fel_write_and_execute_spl(feldev_handle *dev, uint8_t *buf, size_t len)
 {
 	soc_info_t *soc_info = dev->soc_info;
 	sram_swap_buffers *swap_buffers;
 	char header_signature[9] = { 0 };
 	size_t i, thunk_size;
+	thunk_t *thunk;
 	uint32_t *thunk_buf;
 	uint32_t sp, sp_irq;
-	uint32_t spl_checksum, spl_len, spl_len_limit = SPL_LEN_LIMIT;
+	uint32_t spl_checksum, spl_len, spl_len_limit;
 	uint32_t *buf32 = (uint32_t *)buf;
 	uint32_t cur_addr = soc_info->spl_addr;
 	uint32_t *tt = NULL;
@@ -738,6 +742,10 @@ void aw_fel_write_and_execute_spl(feldev_handle *dev, uint8_t *buf, size_t len)
 		pr_fatal("SPL: Unsupported SoC type\n");
 	if (len < 32 || memcmp(buf + 4, "eGON.BT0", 8) != 0)
 		pr_fatal("SPL: eGON header is not found\n");
+
+	thunk = fel_to_spl_thunk(soc_info);
+	if (!thunk)
+		pr_fatal("Failed to find thunk code for the SoC\n");
 
 	spl_checksum = 2 * le32toh(buf32[3]) - 0x5F0A6C39;
 	spl_len = le32toh(buf32[4]);
@@ -782,6 +790,8 @@ void aw_fel_write_and_execute_spl(feldev_handle *dev, uint8_t *buf, size_t len)
 		tt = aw_generate_mmu_translation_table();
 	}
 
+	spl_len_limit = soc_info->sram_size;
+
 	swap_buffers = soc_info->swap_buffers;
 	for (i = 0; swap_buffers[i].size; i++) {
 		if ((swap_buffers[i].buf2 >= soc_info->spl_addr) &&
@@ -808,8 +818,8 @@ void aw_fel_write_and_execute_spl(feldev_handle *dev, uint8_t *buf, size_t len)
 	}
 
 	/* Clarify the SPL size limitations, and bail out if they are not met */
-	if (soc_info->thunk_addr < spl_len_limit)
-		spl_len_limit = soc_info->thunk_addr;
+	if (soc_info->thunk_addr - soc_info->spl_addr < spl_len_limit)
+		spl_len_limit = soc_info->thunk_addr - soc_info->spl_addr;
 
 	if (spl_len > spl_len_limit)
 		pr_fatal("SPL: too large (need %u, have %u)\n",
@@ -819,7 +829,7 @@ void aw_fel_write_and_execute_spl(feldev_handle *dev, uint8_t *buf, size_t len)
 	if (len > 0)
 		aw_fel_write(dev, buf, cur_addr, len);
 
-	thunk_size = sizeof(fel_to_spl_thunk) + sizeof(soc_info->spl_addr) +
+	thunk_size = thunk->size + sizeof(soc_info->spl_addr) +
 		     (i + 1) * sizeof(*swap_buffers);
 
 	if (thunk_size > soc_info->thunk_size)
@@ -827,10 +837,10 @@ void aw_fel_write_and_execute_spl(feldev_handle *dev, uint8_t *buf, size_t len)
 			 (int)sizeof(fel_to_spl_thunk), soc_info->thunk_size);
 
 	thunk_buf = malloc(thunk_size);
-	memcpy(thunk_buf, fel_to_spl_thunk, sizeof(fel_to_spl_thunk));
-	memcpy(thunk_buf + sizeof(fel_to_spl_thunk) / sizeof(uint32_t),
+	memcpy(thunk_buf, thunk->code, thunk->size);
+	memcpy(thunk_buf + thunk->size / sizeof(uint32_t),
 	       &soc_info->spl_addr, sizeof(soc_info->spl_addr));
-	memcpy(thunk_buf + sizeof(fel_to_spl_thunk) / sizeof(uint32_t) + 1,
+	memcpy(thunk_buf + thunk->size / sizeof(uint32_t) + 1,
 	       swap_buffers, (i + 1) * sizeof(*swap_buffers));
 
 	for (i = 0; i < thunk_size / sizeof(uint32_t); i++)
@@ -855,6 +865,8 @@ void aw_fel_write_and_execute_spl(feldev_handle *dev, uint8_t *buf, size_t len)
 	/* re-enable the MMU if it was enabled by BROM */
 	if (tt != NULL)
 		aw_restore_and_enable_mmu(dev, soc_info, tt);
+
+	return spl_len;
 }
 
 /*
@@ -863,21 +875,13 @@ void aw_fel_write_and_execute_spl(feldev_handle *dev, uint8_t *buf, size_t len)
  * address stored within the image header; and the function preserves the
  * U-Boot entry point (offset) and size values.
  */
-void aw_fel_write_uboot_image(feldev_handle *dev, uint8_t *buf, size_t len)
+static void aw_fel_write_uboot_image(feldev_handle *dev, uint8_t *buf,
+				     size_t len, const char *dt_name)
 {
 	if (len <= HEADER_SIZE)
 		return; /* Insufficient size (no actual data), just bail out */
 
 	image_header_t hdr = *(image_header_t *)buf;
-
-	uint32_t hcrc = be32toh(hdr.ih_hcrc);
-
-	/* The CRC is calculated on the whole header but the CRC itself */
-	hdr.ih_hcrc = 0;
-	uint32_t computed_hcrc = crc32(0, (const uint8_t *) &hdr, HEADER_SIZE);
-	if (hcrc != computed_hcrc)
-		pr_fatal("U-Boot header CRC mismatch: expected %x, got %x\n",
-			 hcrc, computed_hcrc);
 
 	/* Check for a valid mkimage header */
 	int image_type = get_image_type(buf, len);
@@ -895,9 +899,24 @@ void aw_fel_write_uboot_image(feldev_handle *dev, uint8_t *buf, size_t len)
 		}
 		exit(1);
 	}
+	if (image_type == IH_TYPE_FLATDT) {		/* FIT image */
+		uboot_entry = load_fit_images(dev, buf, dt_name,
+					      &enter_in_aarch64);
+		uboot_size = 4;		/* dummy value to pass check below */
+		return;
+	}
+
 	if (image_type != IH_TYPE_FIRMWARE)
 		pr_fatal("U-Boot image type mismatch: "
 			 "expected IH_TYPE_FIRMWARE, got %02X\n", image_type);
+
+	/* The CRC is calculated on the whole header but the CRC itself */
+	uint32_t hcrc = be32toh(hdr.ih_hcrc);
+	hdr.ih_hcrc = 0;
+	uint32_t computed_hcrc = crc32(0, (const uint8_t *) &hdr, HEADER_SIZE);
+	if (hcrc != computed_hcrc)
+		pr_fatal("U-Boot header CRC mismatch: expected %x, got %x\n",
+			 hcrc, computed_hcrc);
 
 	uint32_t data_size = be32toh(hdr.ih_size); /* Image Data Size */
 	uint32_t load_addr = be32toh(hdr.ih_load); /* Data Load Address */
@@ -923,19 +942,50 @@ void aw_fel_write_uboot_image(feldev_handle *dev, uint8_t *buf, size_t len)
 	uboot_size = data_size;
 }
 
+static const char *spl_get_dtb_name(uint8_t *spl_buf)
+{
+	uint32_t dt_offset;
+
+	if (memcmp(spl_buf + 4, "eGON.BT0", 8))
+		return NULL;
+
+	if (memcmp(spl_buf + 0x14, "SPL", 3))
+		return NULL;
+
+	if (spl_buf[0x17] < 0x2)			/* only since v0.2 */
+		return NULL;
+
+	memcpy(&dt_offset, spl_buf + 0x20, 4);
+	dt_offset = le32toh(dt_offset);
+
+	if (verbose)
+		printf("found DT name in SPL header: %s\n", spl_buf + dt_offset);
+
+	return (char *)spl_buf + dt_offset;
+}
+
 /*
  * This function handles the common part of both "spl" and "uboot" commands.
  */
 void aw_fel_process_spl_and_uboot(feldev_handle *dev, const char *filename)
 {
-	/* load file into memory buffer */
 	size_t size;
+	uint32_t offset;
+	/* load file into memory buffer */
 	uint8_t *buf = load_file(filename, &size);
+	const char *dt_name = spl_get_dtb_name(buf);
+
 	/* write and execute the SPL from the buffer */
-	aw_fel_write_and_execute_spl(dev, buf, size);
+	offset = aw_fel_write_and_execute_spl(dev, buf, size);
+
 	/* check for optional main U-Boot binary (and transfer it, if applicable) */
-	if (size > SPL_LEN_LIMIT)
-		aw_fel_write_uboot_image(dev, buf + SPL_LEN_LIMIT, size - SPL_LEN_LIMIT);
+	if (size > offset) {
+		/* U-Boot pads to at least 32KB */
+		if (offset < SPL_MIN_OFFSET)
+			offset = SPL_MIN_OFFSET;
+		aw_fel_write_uboot_image(dev, buf + offset, size - offset,
+					 dt_name);
+	}
 	free(buf);
 }
 
@@ -1055,6 +1105,20 @@ void aw_rmr_request(feldev_handle *dev, uint32_t entry_point, bool aarch64)
 	pr_info(" done.\n");
 }
 
+/* Use the watchdog to simply reboot.  Useful to get out of fel without
+ * power cycling or plugging.
+ */
+void aw_wd_reset(feldev_handle *dev)
+{
+	const watchdog_info *wd = dev->soc_info->watchdog;
+	if (!wd) {
+		pr_error("No watchdog information available (yet) for soc: %s\n", dev->soc_info->name);
+		return;
+	}
+	fel_writel(dev, wd->reg_mode, wd->reg_mode_value);
+	pr_info("Requested watchdog reset\n");
+}
+
 /* check buffer for magic "#=uEnv", indicating uEnv.txt compatible format */
 static bool is_uEnv(void *buffer, size_t size)
 {
@@ -1164,6 +1228,7 @@ void usage(const char *cmd) {
 		"	dump address length		Binary memory dump\n"
 		"	exe[cute] address		Call function address\n"
 		"	reset64 address			RMR request for AArch64 warm boot\n"
+		"	wdreset				Reboot via watchdog\n"
 		"	memmove dest source size	Copy <size> bytes within device memory\n"
 		"	readl address			Read 32-bit value from device memory\n"
 		"	writel address value		Write 32-bit value to device memory\n"
@@ -1296,6 +1361,8 @@ int main(int argc, char **argv)
 			/* Cancel U-Boot autostart, and stop processing args */
 			uboot_autostart = false;
 			break;
+		} else if (strcmp(argv[1], "wdreset") == 0) {
+			aw_wd_reset(handle);
 		} else if (strncmp(argv[1], "ver", 3) == 0) {
 			aw_fel_print_version(handle);
 		} else if (strcmp(argv[1], "sid") == 0) {
@@ -1382,7 +1449,10 @@ int main(int argc, char **argv)
 	/* auto-start U-Boot if requested (by the "uboot" command) */
 	if (uboot_autostart) {
 		pr_info("Starting U-Boot (0x%08X).\n", uboot_entry);
-		aw_fel_execute(handle, uboot_entry);
+		if (enter_in_aarch64)
+			aw_rmr_request(handle, uboot_entry, true);
+		else
+			aw_fel_execute(handle, uboot_entry);
 	}
 
 	feldev_done(handle);
